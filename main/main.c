@@ -15,12 +15,24 @@
 #include "driver/spi_common.h"
 #include "driver/sdspi_host.h"
 
+// ----------------- WIFI ------------------- 
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_http_server.h"
+
+#include <dirent.h>
+#include <sys/stat.h>
+
+
 
 // ---------------- TODO ----------------
 //
 // 1. Normalize data output, get rid of noise if possible
 // 2. Try and figure out wireless data uploads
-// 3. Add sending data through USB (UART?) at data collection time (Not through SD)
+// 3. Add sending data through USB (UART?) at data collection time (Not through SD)  -- done using fputs simultinously on stdout
 //
 // --------------------------------------
 
@@ -84,7 +96,7 @@ void readADCs() {
     uint64_t data1 = 0;
 	uint64_t data2 = 0;
 
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 8; i++) {
         data1 = (data1 << 8) | shiftInCustom(ADC_DATA_PIN1, ADC_DATA_CLK1);
 		data2 = (data2 << 8) | shiftInCustom(ADC_DATA_PIN2, ADC_DATA_CLK2);
 
@@ -208,32 +220,167 @@ void IRAM_ATTR onTimer(void* arg) {
 // ---------------- SD TASK (SIMPLIFIED) ----------------
 
 
-//Whole SD write task, needs to be reworked to be SD write and WIFI Upload
+// Start a new SD trial file (/sdcard/trial_N.csv) this often.
+#define TRIAL_ROLL_US (60LL * 1000000)   // 60 seconds
+
+// Open /sdcard/trial_<index>.csv for writing and add the header.
+static FILE* open_trial_file(int index, char* pathOut, size_t pathLen) {
+    snprintf(pathOut, pathLen, "%s/trial_%d.csv", MOUNT_POINT, index);
+    FILE* tf = fopen(pathOut, "w");
+    if (tf) fprintf(tf, "ts(us),FL,FR,BL,BR\n");
+    else    ESP_LOGW("SD", "%s open failed", pathOut);
+    return tf;
+}
+
+//SD write task: appends to data.csv and rolls a new trial_N.csv every minute.
+//Data now leaves the device over WiFi (see start_webserver), not over serial.
 void sdTask(void *arg) {
     char buffer[128];
 
+    // Rolling per-minute trial file on the SD card: trial_1.csv, trial_2.csv, ...
+    int trialIndex = 1;
+    char trialPath[64];
+    FILE* trial = open_trial_file(trialIndex, trialPath, sizeof(trialPath));
+    int64_t fileStart = esp_timer_get_time();
+
     while (true) {
+
+        // Roll over to a new trial file once a minute has elapsed.
+        if (esp_timer_get_time() - fileStart >= TRIAL_ROLL_US) {
+            if (trial) fclose(trial);
+            trialIndex++;
+            trial = open_trial_file(trialIndex, trialPath, sizeof(trialPath));
+            fileStart = esp_timer_get_time();
+        }
 
         if (uxQueueMessagesWaiting(dataQueue) >= 450) {
 
-            FILE* f = fopen("/sdcard/data.csv", "a");
-            if (!f) {
-                printf("File open failed\n");
-                vTaskDelay(pdMS_TO_TICKS(100));
-                continue;
-            }
+            // data.csv writing disabled for now — examining trial files only.
+            // FILE* f = fopen("/sdcard/data.csv", "a");
+            // if (!f) {
+            //     ESP_LOGW("SD", "data.csv open failed");
+            //     vTaskDelay(pdMS_TO_TICKS(100));
+            //     continue;
+            // }
 
             for (int i = 0; i < 450; i++) {
                 if (xQueueReceive(dataQueue, buffer, 0)) {
-                    fputs(buffer, f);
+                    // fputs(buffer, f);
+                    if (trial) fputs(buffer, trial);
                 }
             }
 
-            fclose(f);
+            // fclose(f);
+            if (trial) fflush(trial);   // flush each batch so data reaches the card
 
         } else {
             vTaskDelay(pdMS_TO_TICKS(5));
         }
+    }
+}
+
+// ---------------- WIFI ----------------
+
+#define WIFI_SSID "test"
+#define WIFI_PASS "12345678"
+
+static void wifi_event_handler(void* arg, esp_event_base_t base,
+                               int32_t id, void* data) {
+    if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        ESP_LOGW("WIFI", "disconnected, retrying...");
+        esp_wifi_connect();
+    } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t* e = (ip_event_got_ip_t*) data;
+        ESP_LOGI("WIFI", "connected, IP: " IPSTR, IP2STR(&e->ip_info.ip));
+    }
+}
+
+static void wifi_init_sta(void) {
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(
+        IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+
+    wifi_config_t wifi_config = {
+        .sta = { .ssid = WIFI_SSID, .password = WIFI_PASS },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+}
+
+// ---------------- HTTP FILE SERVER (serves /sdcard) ----------------
+// GET /list           -> "name,size" per line for every file on the card
+// GET /get?file=NAME  -> streams that file's contents
+
+static esp_err_t list_handler(httpd_req_t *req) {
+    DIR* dir = opendir(MOUNT_POINT);
+    if (!dir) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no sd"); return ESP_FAIL; }
+
+    httpd_resp_set_type(req, "text/plain");
+    struct dirent* entry;
+    struct stat st;
+    char path[300], line[128];
+    while ((entry = readdir(dir)) != NULL) {
+        snprintf(path, sizeof(path), "%s/%s", MOUNT_POINT, entry->d_name);
+        long size = (stat(path, &st) == 0) ? (long) st.st_size : 0;
+        int n = snprintf(line, sizeof(line), "%s,%ld\n", entry->d_name, size);
+        httpd_resp_send_chunk(req, line, n);
+    }
+    closedir(dir);
+    httpd_resp_send_chunk(req, NULL, 0);   // end response
+    return ESP_OK;
+}
+
+static esp_err_t get_handler(httpd_req_t *req) {
+    char query[160], fname[80];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "file", fname, sizeof(fname)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing ?file=");
+        return ESP_FAIL;
+    }
+    if (strchr(fname, '/') || strstr(fname, "..")) {   // block path traversal
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "bad name");
+        return ESP_FAIL;
+    }
+
+    char path[300];
+    snprintf(path, sizeof(path), "%s/%s", MOUNT_POINT, fname);
+    FILE* f = fopen(path, "r");
+    if (!f) { httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "no file"); return ESP_FAIL; }
+
+    httpd_resp_set_type(req, "text/csv");
+    char chunk[1024];
+    size_t r;
+    while ((r = fread(chunk, 1, sizeof(chunk), f)) > 0) {
+        if (httpd_resp_send_chunk(req, chunk, r) != ESP_OK) { fclose(f); return ESP_FAIL; }
+    }
+    fclose(f);
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
+static void start_webserver(void) {
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 8192;
+    httpd_handle_t server = NULL;
+    if (httpd_start(&server, &config) == ESP_OK) {
+        httpd_uri_t list_uri = { .uri = "/list", .method = HTTP_GET, .handler = list_handler };
+        httpd_uri_t get_uri  = { .uri = "/get",  .method = HTTP_GET, .handler = get_handler };
+        httpd_register_uri_handler(server, &list_uri);
+        httpd_register_uri_handler(server, &get_uri);
+        ESP_LOGI("HTTP", "file server started");
+    } else {
+        ESP_LOGW("HTTP", "file server failed to start");
     }
 }
 
@@ -245,6 +392,9 @@ void app_main(void) {
     gpio_set_direction((gpio_num_t)CONVST_PIN, GPIO_MODE_OUTPUT);
     gpio_set_direction((gpio_num_t)ADC_DATA_CLK1, GPIO_MODE_OUTPUT);
     gpio_set_direction((gpio_num_t)ADC_DATA_PIN1, GPIO_MODE_INPUT);
+    
+    gpio_set_direction((gpio_num_t)ADC_DATA_CLK2, GPIO_MODE_OUTPUT);
+    gpio_set_direction((gpio_num_t)ADC_DATA_PIN2, GPIO_MODE_INPUT);
 
 	// Queue
 	dataQueue = xQueueCreate(600, 128);  //QUEUE MUST BE MADE BEFORE TIMER, OTHERWISE ESP PANICS AND CRASHES
@@ -259,13 +409,23 @@ void app_main(void) {
     esp_timer_create(&timer_args, &timer);
     esp_timer_start_periodic(timer, 1000000 / (2 * FREQ));
 	
+	// WiFi (joins your PC hotspot). NVS is required by the WiFi stack.
+	esp_err_t nvs = nvs_flash_init();
+	if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+		nvs_flash_erase();
+		nvs = nvs_flash_init();
+	}
+	ESP_ERROR_CHECK(nvs);
+	wifi_init_sta();
+
 	//SD Begin
 	ESP_LOGI("SD", "SD INIT");
 	init_sd_card();
-	if (sdAvailable) init_file();
-	else ESP_LOGI("SD", "SD FAIL");
-	
-
-    // Task
-    if (sdAvailable) xTaskCreate(sdTask, "sdTask", 4096, NULL, 1, NULL);
+	if (sdAvailable) {
+		// init_file();  // disabled — no longer creating/seeding data.csv
+		start_webserver();                                  // serve SD files over HTTP
+		xTaskCreate(sdTask, "sdTask", 4096, NULL, 1, NULL);
+	} else {
+		ESP_LOGI("SD", "SD FAIL");
+	}
 }
