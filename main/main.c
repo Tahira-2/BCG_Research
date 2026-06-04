@@ -223,13 +223,28 @@ static FILE* open_trial_file(int index, char* pathOut, size_t pathLen) {
     return tf;
 }
 
+
+// Find the next free trial index so existing trial_N.csv files are never overwritten.
+static int next_trial_index(void) {
+    char path[64];
+    int index = 1;
+    while (true) {
+        snprintf(path, sizeof(path), "%s/trial_%d.csv", MOUNT_POINT, index);
+        FILE* tf = fopen(path, "r");
+        if (!tf) break;          // first gap → this index is free
+        fclose(tf);
+        index++;
+    }
+    return index;
+}
+
 //SD write task: appends to data.csv and rolls a new trial_N.csv every minute.
 //Data now leaves the device over WiFi
 void sdTask(void *arg) {
     char buffer[128];
 
     // Rolling per-minute trial file on the SD card: trial_1.csv, trial_2.csv, ...
-    int trialIndex = 1;
+    int trialIndex = next_trial_index();
     char trialPath[64];
     FILE* trial = open_trial_file(trialIndex, trialPath, sizeof(trialPath));
     int64_t fileStart = esp_timer_get_time();

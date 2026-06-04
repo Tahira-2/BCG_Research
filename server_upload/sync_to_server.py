@@ -34,6 +34,7 @@ LOCAL_DIR = "data"              # folder of trial_N.csv files on sender PC
 SYNC_SECONDS = 60               # run rsync this every "SYNC_SECONDS "
 
 #path to the receiver's rsync, passed via --rsync-path when set.
+# blank for Linux user
 REMOTE_RSYNC = ""
 
 #On a Linux/Mac sender, set SSH_COMMAND = "" to use the system ssh.
@@ -85,7 +86,7 @@ def main():
             if not ok:
                 print("rsync failed this cycle; will retry next interval. "
                       "Is the server up and SSH reachable?")
-            # Sleep the remainder of the interval (rsync's own runtime counts).
+            # Sleep the remaining of the interval
             elapsed = time.monotonic() - start
             time.sleep(max(0, interval - elapsed))
     except KeyboardInterrupt:
