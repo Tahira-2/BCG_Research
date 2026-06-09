@@ -22,9 +22,11 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
+#include "esp_netif_sntp.h"   // best-effort wall-clock time over WiFi (NTP)
 
 #include <dirent.h>
 #include <sys/stat.h>
+#include <time.h>
 
 
 
@@ -232,13 +234,117 @@ static FILE* open_trial_file(int index, char* pathOut, size_t pathLen) {
     return tf;
 }
 
+// ---- Trial numbering continuity + power-loss logging ----------------------
+#define INTERRUPT_LOG MOUNT_POINT "/interrupt.csv"
+
+// Set by plan_trial_numbering() at boot, read by sdTask and bootLogTask.
+static int g_lastTrial   = 0;   // highest trial_N.csv found from the previous session
+static int g_gapMarker   = 0;   // empty trial_N.csv left as a power-loss marker (0 = none)
+static int g_resumeTrial = 1;   // index sdTask starts writing at this session
+
+// Set true by the WiFi event handler once we actually have an IP. bootLogTask
+// waits on this before trying NTP — WiFi association lags boot by a few seconds.
+static volatile bool s_wifiGotIp = false;
+
+// Highest N among existing /sdcard/trial_N.csv files (0 if none).
+static int find_last_trial_index(void) {
+    DIR* dir = opendir(MOUNT_POINT);
+    if (!dir) return 0;
+    struct dirent* e;
+    int maxN = 0, n;
+    while ((e = readdir(dir)) != NULL) {
+        if (sscanf(e->d_name, "trial_%d.csv", &n) == 1 && n > maxN) maxN = n;
+    }
+    closedir(dir);
+    return maxN;
+}
+
+// Decide this session's starting trial index. If trials already exist, the
+// previous session ended on a power loss, so leave an empty gap-marker file and
+// resume two indices later (e.g. last=6 -> empty trial_7 -> resume at trial_8).
+static void plan_trial_numbering(void) {
+    g_lastTrial = find_last_trial_index();
+    if (g_lastTrial == 0) {
+        g_resumeTrial = 1;   // first boot ever: clean start, no gap
+        g_gapMarker   = 0;
+        return;
+    }
+    g_gapMarker   = g_lastTrial + 1;   // empty marker => "power loss happened here"
+    g_resumeTrial = g_lastTrial + 2;
+    char path[64];
+    snprintf(path, sizeof(path), "%s/trial_%d.csv", MOUNT_POINT, g_gapMarker);
+    FILE* m = fopen(path, "w");         // create as a 0-byte file
+    if (m) fclose(m);
+    else   ESP_LOGW("SD", "gap marker %s create failed", path);
+}
+
+// Append one boot record to the interrupt log (writes a header if file is new).
+// whenStr is a wall-clock string, or "NA" if NTP didn't sync.
+static void write_interrupt_log(const char* whenStr) {
+    struct stat st;
+    bool fresh = (stat(INTERRUPT_LOG, &st) != 0) || st.st_size == 0;
+    FILE* f = fopen(INTERRUPT_LOG, "a");
+    if (!f) { ESP_LOGW("SD", "interrupt.csv open failed"); return; }
+    if (fresh)
+        fprintf(f, "event,wall_time_utc,uptime_us,last_trial,gap_marker,resume_trial\n");
+    fprintf(f, "%s,%s,%lld,%d,%d,%d\n",
+            g_gapMarker ? "RESUME_AFTER_POWER_LOSS" : "FIRST_BOOT",
+            whenStr, (long long) esp_timer_get_time(),
+            g_lastTrial, g_gapMarker, g_resumeTrial);
+    fclose(f);
+    ESP_LOGI("SD", "interrupt log: %s at %s (resume trial_%d)",
+             g_gapMarker ? "resume" : "first boot", whenStr, g_resumeTrial);
+}
+
+// Best-effort wall-clock time, then write the boot record. Runs as its own task
+// so none of this waiting delays sampling. Two stages, each independently logged
+// so the monitor tells you which one failed:
+//   1) wait for WiFi to get an IP (association lags boot by a few seconds), then
+//   2) start NTP and wait for it to sync (needs the hotspot to share internet).
+// If either stage times out we log "NA" + the uptime as the fallback indicator.
+#define WIFI_IP_WAIT_MS   20000
+#define NTP_SYNC_WAIT_MS  15000
+
+static void bootLogTask(void* arg) {
+    char when[32];
+    strncpy(when, "NA", sizeof(when));
+
+    int waited = 0;
+    while (!s_wifiGotIp && waited < WIFI_IP_WAIT_MS) {
+        vTaskDelay(pdMS_TO_TICKS(250));
+        waited += 250;
+    }
+
+    if (!s_wifiGotIp) {
+        ESP_LOGW("TIME", "no IP within %d ms -> logging NA (is the hotspot on?)", WIFI_IP_WAIT_MS);
+    } else {
+        ESP_LOGI("TIME", "WiFi up after ~%d ms; starting NTP", waited);
+        esp_sntp_config_t cfg = ESP_NETIF_SNTP_DEFAULT_CONFIG("pool.ntp.org");
+        esp_netif_sntp_init(&cfg);
+        if (esp_netif_sntp_sync_wait(pdMS_TO_TICKS(NTP_SYNC_WAIT_MS)) == ESP_OK) {
+            time_t now = time(NULL);
+            struct tm tm_utc;
+            gmtime_r(&now, &tm_utc);
+            strftime(when, sizeof(when), "%Y-%m-%d %H:%M:%S", &tm_utc);
+        } else {
+            ESP_LOGW("TIME", "got IP but NTP didn't sync -> NA (hotspot sharing internet?)");
+        }
+        esp_netif_sntp_deinit();
+    }
+
+    write_interrupt_log(when);
+    vTaskDelete(NULL);
+}
+
 //SD write task: appends to data.csv and rolls a new trial_N.csv every minute.
 //Data now leaves the device over WiFi (see start_webserver), not over serial.
 void sdTask(void *arg) {
     char buffer[128];
 
-    // Rolling per-minute trial file on the SD card: trial_1.csv, trial_2.csv, ...
-    int trialIndex = 1;
+    // Rolling per-minute trial file on the SD card. Numbering continues across
+    // power cycles (see plan_trial_numbering), so this is trial_1 only on the
+    // very first boot; after a power loss it resumes past the gap marker.
+    int trialIndex = g_resumeTrial;
     char trialPath[64];
     FILE* trial = open_trial_file(trialIndex, trialPath, sizeof(trialPath));
     int64_t fileStart = esp_timer_get_time();
@@ -289,10 +395,12 @@ static void wifi_event_handler(void* arg, esp_event_base_t base,
     if (base == WIFI_EVENT && id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_STA_DISCONNECTED) {
+        s_wifiGotIp = false;
         ESP_LOGW("WIFI", "disconnected, retrying...");
         esp_wifi_connect();
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t* e = (ip_event_got_ip_t*) data;
+        s_wifiGotIp = true;
         ESP_LOGI("WIFI", "connected, IP: " IPSTR, IP2STR(&e->ip_info.ip));
     }
 }
@@ -416,15 +524,17 @@ void app_main(void) {
 		nvs = nvs_flash_init();
 	}
 	ESP_ERROR_CHECK(nvs);
-	wifi_init_sta();
+	wifi_init_sta();                                        // NTP is started later, in bootLogTask
 
 	//SD Begin
 	ESP_LOGI("SD", "SD INIT");
 	init_sd_card();
 	if (sdAvailable) {
 		// init_file();  // disabled — no longer creating/seeding data.csv
+		plan_trial_numbering();                             // continue numbering; mark power-loss gap
 		start_webserver();                                  // serve SD files over HTTP
 		xTaskCreate(sdTask, "sdTask", 4096, NULL, 1, NULL);
+		xTaskCreate(bootLogTask, "bootLog", 4096, NULL, 1, NULL);  // log boot to interrupt.csv
 	} else {
 		ESP_LOGI("SD", "SD FAIL");
 	}
