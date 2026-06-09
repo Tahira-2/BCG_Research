@@ -296,12 +296,6 @@ static void write_interrupt_log(const char* whenStr) {
              g_gapMarker ? "resume" : "first boot", whenStr, g_resumeTrial);
 }
 
-// Best-effort wall-clock time, then write the boot record. Runs as its own task
-// so none of this waiting delays sampling. Two stages, each independently logged
-// so the monitor tells you which one failed:
-//   1) wait for WiFi to get an IP (association lags boot by a few seconds), then
-//   2) start NTP and wait for it to sync (needs the hotspot to share internet).
-// If either stage times out we log "NA" + the uptime as the fallback indicator.
 #define WIFI_IP_WAIT_MS   20000
 #define NTP_SYNC_WAIT_MS  15000
 
