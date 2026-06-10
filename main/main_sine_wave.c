@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -22,23 +23,12 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
-
-#include <dirent.h>
-#include <sys/stat.h>
-
-
-// ----------------- WIFI ------------------- 
-#include "esp_wifi.h"
-#include "esp_event.h"
-#include "esp_netif.h"
-#include "esp_log.h"
-#include "nvs_flash.h"
-#include "esp_http_server.h"
 #include "esp_netif_sntp.h"   
 
 #include <dirent.h>
 #include <sys/stat.h>
 #include <time.h>
+
 
 // ---------------- PINS ----------------
 #define CONVST_PIN 0
@@ -92,24 +82,25 @@ uint8_t shiftInCustom(uint32_t dataPin, uint32_t clkPin) {
     return value;
 }
 
-// ---------------- ADC READ ----------------
-//Read the ADCs on the board and add the data to a buffer for uploading
+// ---------------- ADC READ (SINE TEST MODE) ----------------
+// CHECK MODE: instead of reading the real ADCs, synthesize a sine wave so
+
+#define SINE_HZ   20.0f      
+#define SINE_MID  32768.0f   //midscale offset (keeps values in 16-bit range)
+
 void readADCs() {
-    ets_delay_us(10);
+    static uint32_t sampleN = 0; 
 
-    uint64_t data1 = 0;
-	uint64_t data2 = 0;
+    // Phase advances by exactly one sample step each call. 2*pi*f*n/Fs.
+    float phase = 2.0f * (float)M_PI * SINE_HZ * (float)sampleN / (float)FREQ;
+    float s = sinf(phase);
+    sampleN++;
 
-    for (int i = 0; i < 8; i++) {
-        data1 = (data1 << 8) | shiftInCustom(ADC_DATA_PIN1, ADC_DATA_CLK1);
-		data2 = (data2 << 8) | shiftInCustom(ADC_DATA_PIN2, ADC_DATA_CLK2);
-
-    }
-	// Data is stored as a 64-bit value, separated into 4 16-bit fields for each ADC, we only care about the 1st and 3rd field, hence we mask with 0xFFFF
-    dataBuffer.FL = (data1 & 0xFFFF);
-	dataBuffer.FR = (data1>>32 & 0xFFFF);
-	dataBuffer.BL = (data2 & 0xFFFF);
-	dataBuffer.BR = (data2>>32 & 0xFFFF);
+    // Four different amplitudes
+    dataBuffer.FL = SINE_MID +  2000.0f * s;
+    dataBuffer.FR = SINE_MID +  6000.0f * s;
+    dataBuffer.BL = SINE_MID + 12000.0f * s;
+    dataBuffer.BR = SINE_MID + 24000.0f * s;
 
     char line[128];
     snprintf(line, sizeof(line), "%llu,%.6f,%.6f,%.6f,%.6f\n",
@@ -261,11 +252,13 @@ static int find_last_trial_index(void) {
     return maxN;
 }
 
-// Decide this session's starting trial index. 
+// Decide this session's starting trial index. If trials already exist, the
+// previous session ended on a power loss, so leave an empty gap-marker file and
+// resume two indices later (e.g. last=6 -> empty trial_7 -> resume at trial_8).
 static void plan_trial_numbering(void) {
     g_lastTrial = find_last_trial_index();
     if (g_lastTrial == 0) {
-        g_resumeTrial = 1;   // first boot ever: clean start
+        g_resumeTrial = 1;   // first boot ever: clean start, no gap
         g_gapMarker   = 0;
         return;
     }
@@ -331,10 +324,11 @@ static void bootLogTask(void* arg) {
 }
 
 //SD write task: appends to data.csv and rolls a new trial_N.csv every minute.
+//Data now leaves the device over WiFi (see start_webserver), not over serial.
 void sdTask(void *arg) {
     char buffer[128];
 
-    // Rolling trial file on the SD card. Numbering continues across
+    // Rolling per-minute trial file on the SD card. Numbering continues across
     // power cycles (see plan_trial_numbering), so this is trial_1 only on the
     // very first boot; after a power loss it resumes past the gap marker.
     int trialIndex = g_resumeTrial;
