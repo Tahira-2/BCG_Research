@@ -105,7 +105,8 @@ void readADCs() {
 		data2 = (data2 << 8) | shiftInCustom(ADC_DATA_PIN2, ADC_DATA_CLK2);
 
     }
-	// Data is stored as a 64-bit value, separated into 4 16-bit fields for each ADC, we only care about the 1st and 3rd field, hence we mask with 0xFFFF
+	// Data is stored as a 64-bit value, separated into 4 16-bit fields for each ADC
+    // we only care about the 1st and 3rd field, hence we mask with 0xFFFF
     dataBuffer.FL = (data1 & 0xFFFF);
 	dataBuffer.FR = (data1>>32 & 0xFFFF);
 	dataBuffer.BL = (data2 & 0xFFFF);
@@ -221,7 +222,7 @@ void IRAM_ATTR onTimer(void* arg) {
     }
 }
 
-// ---------------- SD TASK (SIMPLIFIED) ----------------
+// ---------------- SD TASK ----------------
 
 
 // Start a new SD trial file (/sdcard/trial_N.csv) this often.
@@ -406,8 +407,10 @@ static void wifi_init_sta(void) {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
+    //for any wifi event -- call esp-event-handler
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    //for the specific IP received -- call esp-event-handler
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 

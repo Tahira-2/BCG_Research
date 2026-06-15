@@ -9,8 +9,7 @@ Usage (run from the repo root):
     python server_upload/download_trials.py "IP"        
     python server_upload/download_trials.py "IP" data   # IP + output folder
 
-Find the ESP32's IP from `idf.py monitor` at boot (it logs "WIFI connected, IP: ..."),
-or from Windows Settings -> Mobile hotspot -> Devices connected.
+Find the ESP32's IP from `idf.py monitor` at boot
 """
 
 import os
