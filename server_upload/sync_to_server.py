@@ -52,7 +52,8 @@ def build_command(rsync, remote, remote_dir, local_dir, remote_rsync="",
         cmd.append(f"--rsync-path={remote_rsync}")
     cmd += [src, dest]
     return cmd
-
+#from linux
+#rsync -avz --partial source_folder/ user@windows_ip:/path/on/windows/
 
 def sync_once(cmd):
     """Run one rsync pass. Returns True on success (exit code 0)."""
