@@ -38,8 +38,8 @@ SYNC_SECONDS = 60               # run rsync this every "SYNC_SECONDS "
 REMOTE_RSYNC = ""
 
 #On a Linux/Mac sender, set SSH_COMMAND = "" to use the system ssh.
-SSH_COMMAND = "/usr/bin/ssh -i /c/Users/tahir/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new"
-
+#SSH_COMMAND = "/usr/bin/ssh -i /c/Users/tahir/.ssh/id_ed25519 -o StrictHostKeyChecking=accept-new"
+SHH_COMMAND = ""
 
 def build_command(rsync, remote, remote_dir, local_dir, remote_rsync="",
                   ssh_command=""):
