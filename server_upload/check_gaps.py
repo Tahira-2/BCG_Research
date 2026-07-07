@@ -9,7 +9,6 @@ and the worst gap.
 Usage (run from the repo root):
     python server_upload/check_gaps.py data            # check every *.csv in the folder
     python server_upload/check_gaps.py data/trial_3.csv
-    python server_upload/check_gaps.py data 256        # folder + sample rate (Hz)
 """
 
 import glob
@@ -18,10 +17,13 @@ import sys
 
 NOMINAL_HZ = 256
 
+#A gap under this that still exceeds 1.5 periods is a genuine drop.
+PAUSE_THRESHOLD_US = 2_000_000  # 2 s
+
 
 def check_file(path, period_us):
-    """Return (n_samples, n_gaps, est_dropped, max_gap_us, n_corrupt) for one file.
-    """
+    #Return stats for one file:
+   
     timestamps = []
     n_corrupt = 0
     with open(path, "rb") as f:
@@ -47,23 +49,29 @@ def check_file(path, period_us):
                 continue
 
     if len(timestamps) < 2:
-        return len(timestamps), 0, 0, 0, n_corrupt
+        return len(timestamps), 0, 0, 0, n_corrupt, 0, 0
 
     n_gaps = 0
     est_dropped = 0
     max_gap = 0
-    # A gap is "too large" if it exceeds 1.5 periods (allows normal jitter).
+    n_pauses = 0
+    pause_us = 0
+    # A gap is considered if it exceeds 1.5 periods.
     threshold = 1.5 * period_us
     for prev, cur in zip(timestamps, timestamps[1:]):
         delta = cur - prev
+        if delta > PAUSE_THRESHOLD_US:
+            # Intended pause (collect/pause cycle or switch press), not a drop.
+            n_pauses += 1
+            pause_us += delta
+            continue
         if delta > max_gap:
             max_gap = delta
         if delta > threshold:
             n_gaps += 1
-            # round(delta / period) - 1 samples are missing in this gap
             est_dropped += max(0, round(delta / period_us) - 1)
 
-    return len(timestamps), n_gaps, est_dropped, max_gap, n_corrupt
+    return len(timestamps), n_gaps, est_dropped, max_gap, n_corrupt, n_pauses, pause_us
 
 
 def main():
@@ -80,15 +88,16 @@ def main():
         print(f"No CSV files found at {target}")
         return
 
-    print(f"Sample rate {hz} Hz  ->  nominal gap {period_us:.1f} us\n")
-    print(f"{'file':<24}{'samples':>9}{'big gaps':>10}{'dropped':>9}{'corrupt':>9}{'max gap us':>12}")
-    print("-" * 73)
+    print(f"Sample rate {hz} Hz  ->  nominal gap {period_us:.1f} us")
+    print(f"(gaps > {PAUSE_THRESHOLD_US / 1e6:.0f} s counted as intended pauses, not loss)\n")
+    print(f"{'file':<24}{'samples':>9}{'big gaps':>10}{'dropped':>9}{'pauses':>8}{'corrupt':>9}{'max gap us':>12}")
+    print("-" * 81)
 
-    tot_samples = tot_dropped = tot_corrupt = 0
+    tot_samples = tot_dropped = tot_corrupt = tot_pauses = 0
     n_corrupt_files = 0
     for path in paths:
         try:
-            n, gaps, dropped, max_gap, corrupt = check_file(path, period_us)
+            n, gaps, dropped, max_gap, corrupt, pauses, pause_us = check_file(path, period_us)
         except Exception as e:
             # Never let one unreadable file abort the whole report.
             print(f"{os.path.basename(path):<24}  <-- could not read ({e})")
@@ -102,13 +111,16 @@ def main():
         else:
             tot_samples += n
             tot_dropped += dropped
-            flag = "  <-- loss" if dropped else ""
-        print(f"{os.path.basename(path):<24}{n:>9}{gaps:>10}{dropped:>9}{corrupt:>9}{max_gap:>12}{flag}")
+            tot_pauses += pauses
+            flag = "  <-- loss" if dropped else ("  <-- pause" if pauses else "")
+        print(f"{os.path.basename(path):<24}{n:>9}{gaps:>10}{dropped:>9}{pauses:>8}{corrupt:>9}{max_gap:>12}{flag}")
 
-    print("-" * 73)
+    print("-" * 81)
     if tot_samples:
         pct = 100.0 * tot_dropped / (tot_samples + tot_dropped)
         print(f"TOTAL  samples={tot_samples}  est dropped={tot_dropped}  ({pct:.2f}% loss)")
+        if tot_pauses:
+            print(f"       {tot_pauses} intended pause(s) excluded from the loss figure")
     if n_corrupt_files:
         print(f"WARNING: {n_corrupt_files} file(s) corrupted ({tot_corrupt} bad lines) -- "
               f"their gap stats are unreliable around the damage.")

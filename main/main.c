@@ -70,6 +70,14 @@ static DataPoint dataBuffer;
 static QueueHandle_t dataQueue;
 
 bool sdAvailable = false;
+static volatile bool collecting = true;
+static volatile bool switch_on = true;
+
+#define COLLECT_MIN 10     // N: minutes collecting
+#define PAUSE_MIN   5    // M: minutes paused
+#define COLLECT_US  ((int64_t)COLLECT_MIN * 60 * 1000000)
+#define PAUSE_US    ((int64_t)PAUSE_MIN   * 60 * 1000000)
+
 
 // ---------------- SHIFT IN (REPLACEMENT) ----------------
 //Shift in data from pin, Serial Data Reader
@@ -105,7 +113,8 @@ void readADCs() {
 		data2 = (data2 << 8) | shiftInCustom(ADC_DATA_PIN2, ADC_DATA_CLK2);
 
     }
-	// Data is stored as a 64-bit value, separated into 4 16-bit fields for each ADC, we only care about the 1st and 3rd field, hence we mask with 0xFFFF
+	// Data is stored as a 64-bit value, separated into 4 16-bit fields for each ADC
+    // we only care about the 1st and 3rd field, hence we mask with 0xFFFF
     dataBuffer.FL = (data1 & 0xFFFF);
 	dataBuffer.FR = (data1>>32 & 0xFFFF);
 	dataBuffer.BL = (data2 & 0xFFFF);
@@ -212,6 +221,9 @@ void init_file() {
 // ---------------- TIMER CALLBACK ----------------
 //Interrupt to sample and read data
 void IRAM_ATTR onTimer(void* arg) {
+    if(!collecting)
+        return;     //pause sampling ( collecting is forced false while a switch pause waits out the cycle)
+
     GPIO_OUT_REG ^= BIT(CONVST_PIN);
 
     dataBuffer.timestamp = esp_timer_get_time();
@@ -221,11 +233,11 @@ void IRAM_ATTR onTimer(void* arg) {
     }
 }
 
-// ---------------- SD TASK (SIMPLIFIED) ----------------
+// ---------------- SD TASK ----------------
 
 
 // Start a new SD trial file (/sdcard/trial_N.csv) this often.
-#define TRIAL_ROLL_US (60LL * 1000000)   // 60 seconds
+#define TRIAL_ROLL_US (60LL * 1000000 * 5)   // 5 min
 
 // Open /sdcard/trial_<index>.csv for writing and add the header.
 static FILE* open_trial_file(int index, char* pathOut, size_t pathLen) {
@@ -238,6 +250,7 @@ static FILE* open_trial_file(int index, char* pathOut, size_t pathLen) {
 
 // ---- Trial numbering continuity + power-loss logging ----------------------
 #define INTERRUPT_LOG MOUNT_POINT "/interrupt.csv"
+#define SWITCH_LOG MOUNT_POINT "/switch.csv"
 
 // Set by plan_trial_numbering() at boot, read by sdTask and bootLogTask.
 static int g_lastTrial   = 0;   // highest trial_N.csv found from the previous session
@@ -296,6 +309,24 @@ static void write_interrupt_log(const char* whenStr) {
              g_gapMarker ? "resume" : "first boot", whenStr, g_resumeTrial);
 }
 
+// Append one switch-press event to switch.csv (writes a header if the file is new).
+// elapsed_us is the time from the current cycle's start until the switch paused
+// data collection; it is logged in seconds.
+static void write_switch_log(int cycle, int trial, int64_t elapsed_us) {
+    struct stat status;
+    bool fresh = (stat(SWITCH_LOG, &status) != 0) || status.st_size == 0;
+    FILE* f = fopen(SWITCH_LOG, "a");
+    if (!f) { ESP_LOGW("SD", "switch.csv open failed"); return; }
+
+    if (fresh)
+        fprintf(f, "action,cycle,trial,time_passed_s\n");
+    fprintf(f, "switch-pressed,%d,%d,%.3f\n",
+            cycle, trial, elapsed_us / 1000000.0);
+    fclose(f);
+}
+
+
+
 #define WIFI_IP_WAIT_MS   20000
 #define NTP_SYNC_WAIT_MS  15000
 
@@ -330,7 +361,7 @@ static void bootLogTask(void* arg) {
     vTaskDelete(NULL);
 }
 
-//SD write task: appends to data.csv and rolls a new trial_N.csv every minute.
+//SD rolls a new trial_N.csv every minute.
 void sdTask(void *arg) {
     char buffer[128];
 
@@ -339,18 +370,84 @@ void sdTask(void *arg) {
     // very first boot; after a power loss it resumes past the gap marker.
     int trialIndex = g_resumeTrial;
     char trialPath[64];
+
     FILE* trial = open_trial_file(trialIndex, trialPath, sizeof(trialPath));
+
     int64_t fileStart = esp_timer_get_time();
+    int64_t cycleStart = esp_timer_get_time();
+
+    // --- switch.csv event tracking ---
+    bool          prevSwitch     = switch_on;   // edge-detect a press so it logs once
+    bool          prevCollecting = false;       // edge-detect cycle start / collection end (prints once)
+    const int64_t period         = COLLECT_US + PAUSE_US;
 
     while (true) {
+        //determine collecting phase
+        int64_t elapsed = esp_timer_get_time() - cycleStart;
+        int64_t phase   = elapsed % period;
+        collecting = (phase < COLLECT_US);
+        int cycleNumber = (int)(elapsed / period) + 1;
 
-        // Roll over to a new trial file once a minute has elapsed.
-        if (esp_timer_get_time() - fileStart >= TRIAL_ROLL_US) {
-            if (trial) fclose(trial);
+        // cycle start: pause -> collect edge
+        if (collecting && !prevCollecting)
+            ESP_LOGI("CYCLE", "cycle start #%d", cycleNumber);
+
+        // switch pressed while collecting: stop now and sleep out the rest of the cycle
+        if (collecting && prevSwitch && !switch_on) {
+            write_switch_log(cycleNumber, trialIndex, phase);  // phase = time since cycle start
+            ESP_LOGI("CYCLE", "switch happened, collection stopped at trial #%d", trialIndex);
+
+            collecting = false;                 // onTimer keys off this -> sampling stops
+            if (trial) {                        // flush + close the in-progress trial file
+                while (xQueueReceive(dataQueue, buffer, 0)) fputs(buffer, trial);
+                fflush(trial);
+                fclose(trial);
+                trial = NULL;
+            }
+            int64_t remaining = period - phase;              // time until the next cycle starts
+            prevSwitch     = switch_on;         // avoid a stale edge on wake
+            prevCollecting = false;
+            vTaskDelay(pdMS_TO_TICKS(remaining / 1000));      // sleep out the remainder of the cycle
+            continue;                           // wake at the next cycle start; loop recomputes phase
+        }
+
+        // collection ended normally (collect -> pause edge, no switch this cycle)
+        if (!collecting && prevCollecting)
+            ESP_LOGI("CYCLE", "collection stopped at/after trial #%d", trialIndex);
+
+        prevSwitch     = switch_on;
+        prevCollecting = collecting;
+
+        // Pause handling: close the trial file on a file boundary
+        // sleep for remaining time
+        if (!collecting && trial) {
+            while (xQueueReceive(dataQueue, buffer, 0)) {
+                fputs(buffer, trial);
+            }
+            fflush(trial);
+            fclose(trial);
+            trial = NULL;
+
+            int64_t remaining = period - phase;   // time until the next cycle starts
+            vTaskDelay(pdMS_TO_TICKS(remaining / 1000));
+            continue;
+        }
+
+        // Resume handling: start a fresh trial file so post-resume samples
+        if (collecting && !trial) {
             trialIndex++;
             trial = open_trial_file(trialIndex, trialPath, sizeof(trialPath));
             fileStart = esp_timer_get_time();
         }
+
+        // Roll over to a new trial file once the interval has elapsed.
+        if ( collecting && trial && (esp_timer_get_time() - fileStart >= TRIAL_ROLL_US)) {
+            fclose(trial);
+            trialIndex++;
+            trial = open_trial_file(trialIndex, trialPath, sizeof(trialPath));
+            fileStart = esp_timer_get_time();
+        }
+
 
         if (uxQueueMessagesWaiting(dataQueue) >= 450) {
 
@@ -406,8 +503,10 @@ static void wifi_init_sta(void) {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
+    //for any wifi event -- call esp-event-handler
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    //for the specific IP received -- call esp-event-handler
     ESP_ERROR_CHECK(esp_event_handler_instance_register(
         IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 
@@ -470,6 +569,20 @@ static esp_err_t get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static esp_err_t switch_handler(httpd_req_t* req){
+    char query[64], val[8];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
+        httpd_query_key_value(query, "state", val, sizeof(val)) != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "missing ?state=");
+        return ESP_FAIL;
+    }
+    switch_on = (val[0] == '1');
+    ESP_LOGI("SWITCH", "switch_on = %d", switch_on);
+    httpd_resp_sendstr(req, switch_on ? "active\n" : "paused\n");
+    return ESP_OK;   
+}
+
+
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 8192;
@@ -477,8 +590,10 @@ static void start_webserver(void) {
     if (httpd_start(&server, &config) == ESP_OK) {
         httpd_uri_t list_uri = { .uri = "/list", .method = HTTP_GET, .handler = list_handler };
         httpd_uri_t get_uri  = { .uri = "/get",  .method = HTTP_GET, .handler = get_handler };
+        httpd_uri_t switch_uri = { .uri = "/switch", .method = HTTP_GET, .handler = switch_handler};
         httpd_register_uri_handler(server, &list_uri);
         httpd_register_uri_handler(server, &get_uri);
+        httpd_register_uri_handler(server, &switch_uri);
         ESP_LOGI("HTTP", "file server started");
     } else {
         ESP_LOGW("HTTP", "file server failed to start");
@@ -498,7 +613,7 @@ void app_main(void) {
     gpio_set_direction((gpio_num_t)ADC_DATA_PIN2, GPIO_MODE_INPUT);
 
 	// Queue
-	dataQueue = xQueueCreate(600, 128);  //QUEUE MUST BE MADE BEFORE TIMER, OTHERWISE ESP PANICS AND CRASHES
+	dataQueue = xQueueCreate(600, 128);  //QUEUE MUST BE MADE BEFORE TIMER
 	
     // Timer (ESP-IDF way)
     const esp_timer_create_args_t timer_args = {
@@ -510,7 +625,7 @@ void app_main(void) {
     esp_timer_create(&timer_args, &timer);
     esp_timer_start_periodic(timer, 1000000 / (2 * FREQ));
 	
-	// WiFi (joins your PC hotspot). NVS is required by the WiFi stack.
+	// WiFi
 	esp_err_t nvs = nvs_flash_init();
 	if (nvs == ESP_ERR_NVS_NO_FREE_PAGES || nvs == ESP_ERR_NVS_NEW_VERSION_FOUND) {
 		nvs_flash_erase();

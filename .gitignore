@@ -3,3 +3,4 @@ managed_components/
 sdkconfig.old
 dependencies.lock
 data/
+server_upload/__pycache__
