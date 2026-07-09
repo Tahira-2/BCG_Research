@@ -22,23 +22,14 @@
 #include "esp_log.h"
 #include "nvs_flash.h"
 #include "esp_http_server.h"
-
-#include <dirent.h>
-#include <sys/stat.h>
-
-
-// ----------------- WIFI ------------------- 
-#include "esp_wifi.h"
-#include "esp_event.h"
-#include "esp_netif.h"
-#include "esp_log.h"
-#include "nvs_flash.h"
-#include "esp_http_server.h"
 #include "esp_netif_sntp.h"   
 
 #include <dirent.h>
 #include <sys/stat.h>
 #include <time.h>
+
+// --------------- OTA --------------------
+#include "esp_ota_ops.h"
 
 // ---------------- PINS ----------------
 #define CONVST_PIN 0
@@ -72,8 +63,9 @@ static QueueHandle_t dataQueue;
 bool sdAvailable = false;
 static volatile bool collecting = true;
 static volatile bool switch_on = true;
+static volatile bool ota_in_progress = false;
 
-#define COLLECT_MIN 10     // N: minutes collecting
+#define COLLECT_MIN 5     // N: minutes collecting
 #define PAUSE_MIN   5    // M: minutes paused
 #define COLLECT_US  ((int64_t)COLLECT_MIN * 60 * 1000000)
 #define PAUSE_US    ((int64_t)PAUSE_MIN   * 60 * 1000000)
@@ -237,7 +229,7 @@ void IRAM_ATTR onTimer(void* arg) {
 
 
 // Start a new SD trial file (/sdcard/trial_N.csv) this often.
-#define TRIAL_ROLL_US (60LL * 1000000 * 5)   // 5 min
+#define TRIAL_ROLL_US (60LL * 1000000 * 2.5)   // 5 min
 
 // Open /sdcard/trial_<index>.csv for writing and add the header.
 static FILE* open_trial_file(int index, char* pathOut, size_t pathLen) {
@@ -522,6 +514,7 @@ static void wifi_init_sta(void) {
 // GET /list           -> "name,size" per line for every file on the card
 // GET /get?file=NAME  -> streams that file's contents
 
+    // --------------- List ----------------------
 static esp_err_t list_handler(httpd_req_t *req) {
     DIR* dir = opendir(MOUNT_POINT);
     if (!dir) { httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no sd"); return ESP_FAIL; }
@@ -541,6 +534,7 @@ static esp_err_t list_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// ------------------- Get File Content --------------------
 static esp_err_t get_handler(httpd_req_t *req) {
     char query[160], fname[80];
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
@@ -569,6 +563,7 @@ static esp_err_t get_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+// ---------------- Get Switch Status -------------------
 static esp_err_t switch_handler(httpd_req_t* req){
     char query[64], val[8];
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK ||
@@ -582,6 +577,94 @@ static esp_err_t switch_handler(httpd_req_t* req){
     return ESP_OK;   
 }
 
+// ---------------- ESP Firmware Update OTA  --------------
+static esp_err_t esp_update_handler(httpd_req_t* req){
+
+    ota_in_progress = true;
+    //TO-DO:    Add a check for unfinished update -> esp_ota_resume()
+    ESP_LOGI("OTA Handler", "OTA request received");
+
+    //find the next partition
+    const esp_partition_t* partition = esp_ota_get_next_update_partition(NULL);
+    if (partition == NULL){
+        ESP_LOGE("Next Partition", "Passive OTA Partition NOT found");
+        ota_in_progress = false;
+        return ESP_ERR_NOT_FOUND;
+    }
+    esp_ota_handle_t handle = 0;
+    ESP_LOGI("OTA Handler", "OTA Process Beginning");
+    esp_err_t ota = esp_ota_begin(partition, OTA_SIZE_UNKNOWN, &handle);
+
+    if(ota != ESP_OK){
+        //error
+        ESP_LOGE("OTA Handler", "OTA Begin failed: %s", esp_err_to_name(ota));
+        ota_in_progress = false;
+        return ota;
+    }
+    ESP_LOGI("OTP Handler", "OTA-begin returned success");
+
+    //read from buffer
+    char ota_buffer[1024];
+    int remaining = req->content_len;
+    int recv_chunk;
+
+    while(remaining > 0){
+        recv_chunk = httpd_req_recv(req, ota_buffer, MIN(remaining, sizeof(ota_buffer)));
+        
+        //error
+        if (recv_chunk <= 0){
+            if (recv_chunk == HTTPD_SOCK_ERR_TIMEOUT) 
+            continue;   //time out -- try again
+            
+            esp_ota_abort(handle);  // clean up after error
+            httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "receive failed");
+            ota_in_progress = false;
+            return ESP_FAIL;
+        }
+    
+        //success -- write
+        ota = esp_ota_write(handle, (const void*) ota_buffer, recv_chunk);
+        
+        if( ota != ESP_OK){
+            //error
+            esp_ota_abort(handle);
+            ESP_LOGI("OTA Handler", "Abbort was called -- write failed");
+            ESP_LOGE("OTA Handler", "OTA Write Failed: %s", esp_err_to_name(ota));
+            ota_in_progress = false;
+            return ota;
+        }
+        remaining -= recv_chunk;
+    }
+    ESP_LOGI("OTA-Handler", "OTA-write returned success");s
+
+    //ota end
+    ota = esp_ota_end(handle);
+    if(ota != ESP_OK){
+        ESP_LOGE("OTA Handler", "Firmware Failed Validation: %s", esp_err_to_name(ota));
+        ota_in_progress = false;
+        return ota;
+    }
+    ESP_LOGI("OTA Handler", "OTA-end returned success");
+
+    ota = esp_ota_set_boot_partition(partition);
+    if (ota != ESP_OK){
+        ESP_LOGE("OTA Handler", "Couldn't Select New firmware: %s", esp_err_to_name(ota));
+        ota_in_progress = false;
+        return ota;       
+    }
+
+    //success
+    ESP_LOGI("OTA Handler", "OTA process ended successfully -- reboot starts");
+    httpd_resp_sendstr(req, "Update successful, rebooting...");
+
+    //Delay for http to receive signal
+    vTaskDelay(pdMS_TO_TICKS(2000));
+
+    ota_in_progress = false;
+    esp_restart();
+}
+
+
 
 static void start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
@@ -591,9 +674,13 @@ static void start_webserver(void) {
         httpd_uri_t list_uri = { .uri = "/list", .method = HTTP_GET, .handler = list_handler };
         httpd_uri_t get_uri  = { .uri = "/get",  .method = HTTP_GET, .handler = get_handler };
         httpd_uri_t switch_uri = { .uri = "/switch", .method = HTTP_GET, .handler = switch_handler};
+        httpd_uri_t ota_uri = { .uri = "/update", .method = HTTP_POST, .handler = esp_update_handler};
+
         httpd_register_uri_handler(server, &list_uri);
         httpd_register_uri_handler(server, &get_uri);
         httpd_register_uri_handler(server, &switch_uri);
+        httpd_register_uri_handler(server, &ota_uri);
+
         ESP_LOGI("HTTP", "file server started");
     } else {
         ESP_LOGW("HTTP", "file server failed to start");
@@ -637,7 +724,7 @@ void app_main(void) {
 	//SD Begin
 	ESP_LOGI("SD", "SD INIT");
 	init_sd_card();
-	if (sdAvailable) {
+	if (sdAvailable && !ota_in_progress) {
 		// init_file();  // disabled — no longer creating/seeding data.csv
 		plan_trial_numbering();                             // continue numbering; mark power-loss gap
 		start_webserver();                                  // serve SD files over HTTP
