@@ -113,8 +113,26 @@ void readADCs() {
 		data2 = (data2 << 8) | shiftInCustom(ADC_DATA_PIN2, ADC_DATA_CLK2);
 
     }
+    
+    //checking the raw 64-bit value
+    static uint32_t n = 0;
+    if (++n % 128 == 0){
+        ESP_LOGI("RAW", "%016llX", data1);
+        ESP_LOGI("RAW", "A=%u  B=%u",
+                 (unsigned)((data1 >> 48) & 0xFFFF),   // [63:48]
+                 (unsigned)((data1 >> 32) & 0xFFFF));  // [47:32]
+    }
+
 	// Data is stored as a 64-bit value, separated into 4 16-bit fields for each ADC
     // we only care about the 1st and 3rd field, hence we mask with 0xFFFF
+/*
+                        ASSUMPTION
+    ERROR NOTE:         Naming Error
+
+            FL = [47:32] = weight,    -> currently being ignored
+            FR = [63:48] = HeartRate  -> currently captured
+*/
+
     dataBuffer.FL = (data1 & 0xFFFF);
 	dataBuffer.FR = (data1>>32 & 0xFFFF);
 	dataBuffer.BL = (data2 & 0xFFFF);
@@ -237,7 +255,7 @@ void IRAM_ATTR onTimer(void* arg) {
 
 
 // Start a new SD trial file (/sdcard/trial_N.csv) this often.
-#define TRIAL_ROLL_US (60LL * 1000000 * 5)   // 5 min
+#define TRIAL_ROLL_US (60LL * 1000000 * 2.5)   // 5 min
 
 // Open /sdcard/trial_<index>.csv for writing and add the header.
 static FILE* open_trial_file(int index, char* pathOut, size_t pathLen) {
@@ -399,7 +417,7 @@ void sdTask(void *arg) {
 
             collecting = false;                 // onTimer keys off this -> sampling stops
             if (trial) {                        // flush + close the in-progress trial file
-                while (xQueueReceive(dataQueue, buffer, 0)) fputs(buffer, trial);
+                while (xQueueReceive(dataQueue, buffer, 0)) fputs(buffer, trial); 
                 fflush(trial);
                 fclose(trial);
                 trial = NULL;
